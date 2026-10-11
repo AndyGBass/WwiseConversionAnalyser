@@ -5,7 +5,7 @@ Wwise right-click command for Sounds: shows what conversion did to each
 selected Sound, as one web page with a tab per Sound.
 
 For each Sound (Sound SFX) it reads the original file and the converted file.
-If there is a Trim in WWise, the Trim is replicated on the source and lines 
+If there is a Trim in Wwise, the Trim is replicated on the source and lines 
 them up for better comparison. The wems are decoded with vgmstream.
 The Analysis reports size, levels, clipping, cutoffs, spectrum and spectrograms.
 The files are summed to mono for the overall comparison, however there is a 
