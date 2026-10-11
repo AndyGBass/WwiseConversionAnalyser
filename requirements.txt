@@ -1,0 +1,4 @@
+# Python packages WwiseConversionAnalyser needs. Install with:  py -m pip install -r requirements.txt
+# Developed and tested with numpy 2.5 and waapi-client 0.8 on Python 3.14.
+numpy
+waapi-client

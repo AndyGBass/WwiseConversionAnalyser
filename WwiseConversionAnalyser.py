@@ -1,54 +1,25 @@
 """
 WwiseConversionAnalyser.py
 
-Right-click helper for Sounds: shows what Wwise's conversion did to each
-selected Sound, as one web page. When several Sounds are selected, the page
-has a tab for each.
+Wwise right-click command for Sounds: shows what conversion did to each
+selected Sound, as one web page with a tab per Sound.
 
-  1. Reads the Sound's active source from Wwise: original file, converted
-     file and trim range.
-  2. Decodes the converted .wem with vgmstream into a scratch folder.
-  3. Cuts the original to the trim range, then lines the converted file up
-     against it sample for sample.
-  4. Renders the spectrograms and embeds them, with the spectrum and the key
-     numbers, in one self-contained web page.
-  5. Deletes the scratch folder (the decoded audio) and opens the page. The
-     page is WwiseConversionAnalyser_Report.html in a WwiseConversionAnalyser
-     folder of the user's temp folder, and every run writes over it;
-     --output-dir keeps reports elsewhere, by name.
+For each Sound (Sound SFX) it reads the original file and the converted file.
+If there is a Trim in WWise, the Trim is replicated on the source and lines 
+them up for better comparison. The wems are decoded with vgmstream.
+The Analysis reports size, levels, clipping, cutoffs, spectrum and spectrograms.
+The files are summed to mono for the overall comparison, however there is a 
+per-channel option which compares every channel on its own.
+Nothing is changed within the Wwise project.
 
-Nothing is played back, and nothing in the Wwise project is changed; with
---convert-if-missing a Sound that has not been converted yet is converted,
-which writes to the project's cache only.
+Needs Python 3.8+ with numpy, Wwise with its Authoring API
+enabled, and vgmstream-cli (in the vgmstream-win64 folder beside this script).
+The folder holding this script must be named WwiseConversionAnalyser and sit
+directly in Add-ons/Commands, as the .json finds the script by that path.
+README.md has the setup steps; the docs folder explains the report and method.
 
-Two reports, each with its own entry in the right-click menu:
-  WwiseConversionAnalyser                every channel mixed to mono
-  WwiseConversionAnalyser (per-channel)  each channel on its own, a tab for
-                                         each (--per-channel). Channels are
-                                         paired by what they contain, since a
-                                         conversion may reorder them. Where
-                                         the conversion changed the number of
-                                         channels, the report follows the
-                                         converted file's and says what each
-                                         was made from.
-
-Requirements
-  - Python 3.8 or later, with numpy and waapi-client:
-        py -m pip install numpy waapi-client
-  - vgmstream-cli (https://vgmstream.org), the only external program. It is
-    looked for beside this script (in a "vgmstream-win64" folder, or loose),
-    then on the PATH; --vgmstream names it outright.
-  - Wwise running, with the Wwise Authoring API enabled in its preferences.
-
-Installation
-  This script, WwiseConversionAnalyser.json and the vgmstream folder live
-  together in a folder named WwiseConversionAnalyser. Copy that folder into
-  a Wwise "Add-ons\\Commands" folder (the project's, or the user's under
-  %APPDATA%\\Audiokinetic\\Wwise). No path needs editing, but the folder must
-  keep its name and sit directly in Commands: Wwise reads the .json from the
-  subfolder, yet its ${CurrentCommandDirectory} is the Commands folder
-  itself, so the .json names the script as
-  ${CurrentCommandDirectory}\\WwiseConversionAnalyser\\WwiseConversionAnalyser.py.
+Copyright (c) 2026 AndyGBass. MIT License, see LICENSE. That licence does not
+cover vgmstream or the libraries that come with it.
 """
 
 import argparse
@@ -81,69 +52,52 @@ except ImportError:
 
 __version__ = "1.0.0"
 
-# The tool's one name, the same wherever it is shown: the entry in Wwise's right-click menu (set in the
-# .json), the heading of the report and of this script's output in Wwise's log, and its folders
+# The tool's one name: the menu entry (in the .json), the report and log headings, and its folders
 TOOL_NAME = "WwiseConversionAnalyser"
 SCRIPT_DIR = Path(__file__).resolve().parent
-# The report is one page in the user's temp folder, written over on every run: a report can be made
-# again at any time, so none is kept, and the temp folder keeps it out of the Wwise project and so out
-# of source control. A browser that has the page open does not stop it being written over; it shows the
-# earlier report until it is reloaded.
+# One report page, written over on every run, in the temp folder to keep it out of source control
 REPORT_PATH = Path(tempfile.gettempdir()) / TOOL_NAME / f"{TOOL_NAME}_Report.html"
-# Longest one file's decode may take before it is given up on, so a stuck decoder cannot hang the
-# command. The clock starts afresh for every file: Sounds selected together each get the full time.
+# Longest one file's decode may take, so a stuck decoder cannot hang the command
 DECODE_TIMEOUT_SECONDS = 60
 
 FREQ_MIN = 20.0
 FREQ_TICKS = (20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000)
 DB_MIN, DB_MAX = -100.0, 0.0
 
-# Lining the converted file up against the original: how far either way to look for the match, how
-# good the match must be before a shift is trusted, and how far it must stand out from the other offsets
+# Alignment: how far to look for the match, and how good and how distinct it must be to be trusted
 MAX_LAG_SECONDS = 0.5
 MIN_CORRELATION = 0.2
 MIN_DISTINCTNESS = 5.0
-# A converted file this much longer or shorter than expected is reported as possibly out of date.
-# Codecs pad to whole blocks, so a few milliseconds are normal.
+# Beyond this the converted file's length is reported as wrong. Codecs pad by a few milliseconds.
 LENGTH_TOLERANCE_SECONDS = 0.010
 
-# Per-channel reports. How much audio is used to tell which converted channel carries which original one
+# Per-channel reports: audio used to tell which converted channel carries which original one
 PAIRING_SECONDS = 10.0
-# Where the converted file has fewer (or more) channels than the original, each of its channels is a mix
-# of the original's. A converted channel must resemble at least one original channel this well for the mix
-# to be worked out (a mix of many channels resembles each of them only a little), and a channel's share of
-# a mix is ignored below this fraction of the largest share.
+# Mix fitting: least resemblance to an original channel to attempt it, smallest share kept (as a
+# fraction of the largest), and the fraction of the converted channel's energy, from the bottom up, used
 MIN_MIX_CORRELATION = 0.1
 MIX_SHARE_FLOOR = 0.05
-# The shares are worked out from the part of the spectrum that holds this fraction of the converted
-# channel's energy, counted from the bottom up, which stays below wherever the conversion took the top off
 MIX_FIT_ENERGY = 0.9
-# Up to this many channels are shown as columns of the summary table, and at full image resolution;
-# beyond it they become rows, and the spectrograms are made at half the resolution to keep the page a usable size
+# Above these, channels become rows of the summary table and spectrograms are made at half resolution
 MAX_CHANNEL_COLUMNS = 6
-# A report on more Sounds than this likewise has its spectrograms made at half the resolution
 MAX_SOUNDS_AT_FULL_RESOLUTION = 6
-# Ambisonic channels by letter, in the order Wwise keeps them in a converted file (ACN): first order
-# W Y Z X, second order adds V T R S U, third order adds Q O M K L N P. Higher orders have no letters.
+# Ambisonic channels by letter in Wwise's order (ACN), up to third order
 AMBISONIC_LETTERS = "WYZXVTRSUQOMKLNP"
-# Speakers in the order of the bits of a WAV file's channel mask, which is also the order of its channels
+# Speakers in the order of a WAV channel mask's bits, which is the order of the channels
 SPEAKERS = ("Front Left", "Front Right", "Centre", "LFE", "Back Left", "Back Right", "Front Left of Centre",
             "Front Right of Centre", "Back Centre", "Side Left", "Side Right", "Top Centre", "Top Front Left",
             "Top Front Centre", "Top Front Right", "Top Back Left", "Top Back Centre", "Top Back Right")
 
-# Spectrogram cells at --scale 1: one per unit of the panel each spectrogram is drawn in on the page.
-# Each step of scale multiplies both.
+# Spectrogram cells at --scale 1, one per unit of the panel it is drawn in
 BASE_COLUMNS = 1086
 BASE_ROWS = 400
-# Analysis window in samples, used for the whole frequency range; must be a power of two. A longer
-# window gives finer frequency detail and coarser timing: at 48 kHz, 16384 is one frequency
-# measurement every 2.9 Hz, from 341 ms of audio per column.
+# Analysis window in samples (a power of two). At 48 kHz: 2.9 Hz resolution from 341 ms per column.
 WINDOW_SIZE = 16384
-# Analysis windows transformed per numpy call, which bounds the memory used
+# Windows transformed per numpy call, which bounds the memory used
 BLOCK = 256
-# Cells where both files are below this power count as unchanged rather than as noise against noise
+# Cells where both files are below this power count as unchanged
 QUIET_FLOOR = 1e-11
-# Beyond a cutoff, the converted file counts as having nothing left once it is this far under the original, in dB
+# Past a cutoff, the converted file has "nothing left" once this many dB under the original
 GONE_DB = 40.0
 
 # Approximation of the "inferno" colour map, and a blue / grey / red map for level change
@@ -173,8 +127,8 @@ class WavFile:
     sample_rate: int
     bits: int
     is_float: bool
-    channel_mask: int  # which speaker each channel feeds, as the file states it; 0 = not stated
-    clipped: List[int]  # for each channel, the samples that sit in a flat spot at full scale
+    channel_mask: int  # which speaker each channel feeds; 0 = not stated
+    clipped: List[int]  # per channel, samples in flat spots at full scale
 
     @property
     def channels(self) -> int:
@@ -206,8 +160,7 @@ def one_channel(wav: WavFile, channel: int) -> Audio:
 
 
 def read_wav(path: str) -> WavFile:
-    """Reads PCM from a RIFF/WAVE file (8/16/24/32-bit integer or 32-bit
-    float), keeping every channel."""
+    """Reads a PCM WAV file (8/16/24/32-bit integer or 32-bit float), keeping every channel."""
     data = Path(path).read_bytes()
     if len(data) < 12 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise AnalysisError(f"Not a RIFF/WAVE file: {path}")
@@ -229,7 +182,7 @@ def read_wav(path: str) -> WavFile:
     is_float = tag == 3
     channel_mask = 0
     if tag == 0xFFFE and len(fmt) >= 40:
-        # WAVE_FORMAT_EXTENSIBLE: a channel mask, then a sub-format GUID that starts with the real format tag
+        # WAVE_FORMAT_EXTENSIBLE: channel mask, then a GUID starting with the real format tag
         channel_mask, sub_tag = struct.unpack_from("<IH", fmt, 20)
         if sub_tag not in (1, 3):
             raise AnalysisError(f"Extensible sub-format 0x{sub_tag:04X} is not PCM: {path}")
@@ -242,18 +195,18 @@ def read_wav(path: str) -> WavFile:
         raise AnalysisError(f"Unsupported sample layout: {path}")
     body = body[:len(body) // (width * channels) * (width * channels)]
 
-    # Held as 32-bit floats, which carry 24-bit audio exactly and take half the memory of 64-bit ones
+    # Held as 32-bit floats: exact for 24-bit audio, at half the memory of 64-bit
     if width == 1:
         samples, scale = np.frombuffer(body, np.uint8).astype(np.float32) - 128, 1 / 128
     elif width == 3:
-        # Each sample goes into the top three bytes of a 32-bit integer, which keeps its sign
+        # Into the top three bytes of a 32-bit integer, which keeps the sign
         wide = np.zeros((len(body) // 3, 4), np.uint8)
         wide[:, 1:] = np.frombuffer(body, np.uint8).reshape(-1, 3)
         samples, scale = wide.view("<i4").ravel().astype(np.float32), 1 / 2147483648
     else:
         samples = np.frombuffer(body, "<f4" if is_float else ("<i2" if width == 2 else "<i4")).astype(np.float32)
         scale = 1.0 if is_float else (1 / 32768 if width == 2 else 1 / 2147483648)
-    samples *= np.float32(scale)  # every scale is a power of two, so nothing is rounded
+    samples *= np.float32(scale)  # a power of two, so nothing is rounded
     frames = samples.reshape(-1, channels)
     top = 1.0 if is_float else 1.0 - 2.0 ** (1 - 8 * width)
     return WavFile(frames, sample_rate, bits, is_float, channel_mask,
@@ -261,10 +214,9 @@ def read_wav(path: str) -> WavFile:
 
 
 def count_clipped(samples: np.ndarray, top: float) -> int:
-    """How many samples of one channel sit in a flat spot at full scale: two
-    or more in a row at the highest value the format can hold (`top`) or at
-    the lowest. That is the mark a cut-off waveform leaves; one sample alone
-    at full scale is just a peak that reaches it."""
+    """Samples of one channel in flat spots at full scale: two or more in a
+    row at the format's highest value (`top`) or its lowest. One alone is
+    just a peak that reaches full scale."""
     at_limit = (samples >= top) | (samples <= -1.0)
     if not at_limit.any():
         return 0
@@ -279,10 +231,8 @@ Details = List[Tuple[str, str]]
 
 
 def file_details(path: str, wav: WavFile, codec: str, bit_rate: str) -> Details:
-    """What the report lists about a file, as (label, value) lines; the path
-    has no label. `wav` is the file as read, or as decoded. A decoded file is
-    described by the codec and bit rate its decoder reported; a file read
-    directly is PCM, described by its sample width."""
+    """What the report lists about a file, as (label, value) lines. `codec` and
+    `bit_rate` are the decoder's words for a decoded file, empty for PCM."""
     channels = {1: "mono", 2: "stereo"}.get(wav.channels, f"{wav.channels} channels")
     return [("", path),
             ("Codec", codec or ("PCM float" if wav.is_float else "PCM")),
@@ -305,25 +255,22 @@ def level_summary(samples: np.ndarray) -> Tuple[float, float]:
 
 @dataclass
 class Pair:
-    """An original signal and its converted copy, cut to the same range, lined
-    up, and at the same sample rate (the original's)."""
+    """An original signal and its converted copy: same range, lined up, same sample rate."""
     original: Audio
     converted: Audio
-    time_offset: float  # where the analysed range starts in the original file, in seconds
-    duration: float  # length of the analysed range in seconds
-    # Diagnostics printed with --verbose, not shown in the report. Plain ASCII, as Wwise's log garbles other characters.
-    facts: Dict[str, str] = field(default_factory=dict)
+    time_offset: float  # start of the analysed range in the original file, in seconds
+    duration: float  # length of the analysed range, in seconds
+    facts: Dict[str, str] = field(default_factory=dict)  # diagnostics for --verbose, in plain ASCII
     warnings: List[str] = field(default_factory=list)
 
 
 def resample(samples: np.ndarray, rate: int, new_rate: int) -> np.ndarray:
-    """Converts audio to another sample rate by resizing its spectrum, which
-    leaves everything below the lower of the two Nyquist frequencies as it was."""
+    """Resamples by resizing the spectrum, which leaves everything below the
+    lower Nyquist frequency as it was."""
     step = math.gcd(rate, new_rate)
-    per_in, per_out = rate // step, new_rate // step  # per_in samples in last as long as per_out samples out
-    # An FFT treats the audio as a loop, so silence is put around it to keep its end from ringing into its
-    # start. The total is rounded up to a length that converts to a whole number of samples and that an
-    # FFT handles quickly. All three lengths are counted in groups of per_in samples.
+    per_in, per_out = rate // step, new_rate // step  # per_in samples in last as long as per_out out
+    # Padded with silence, as an FFT treats audio as a loop, up to a length that converts to a whole
+    # number of samples and that an FFT handles quickly. Lengths are in groups of per_in samples.
     lead = -(-2048 // per_in)
     groups = -(-len(samples) // per_in) + 2 * lead
     round_to = 1 << max(0, groups.bit_length() - 5)
@@ -339,12 +286,10 @@ def resample(samples: np.ndarray, rate: int, new_rate: int) -> np.ndarray:
 
 
 def find_lag(original: np.ndarray, converted: np.ndarray, max_lag_limit: int) -> Optional[Tuple[int, float, float]]:
-    """Finds how many samples the converted file is late by (negative =
-    early), by cross-correlating a section from the middle of the original
-    against the converted file across a range of offsets.
-
-    Returns (lag, correlation, distinctness); distinctness is how far the
-    best match stands above the other offsets, in standard deviations."""
+    """How many samples the converted file is late by (negative = early), from
+    cross-correlating the middle of the original against it. Returns (lag,
+    correlation, distinctness: how far the best match stands above the other
+    offsets, in standard deviations), or None if the files are too short."""
     n = min(len(original), len(converted))
     if n < 4096:
         return None
@@ -361,12 +306,12 @@ def find_lag(original: np.ndarray, converted: np.ndarray, max_lag_limit: int) ->
 
     a = original[start:start + seg]
     b = converted[start - max_lag:start - max_lag + span]
-    # Correlation at every offset in one pass: r[k] = sum(a[i] * b[i + k]) = IFFT(conj(A) * B)
+    # Every offset in one pass: r[k] = sum(a[i] * b[i + k]) = IFFT(conj(A) * B)
     raw = np.fft.irfft(np.conj(np.fft.rfft(a, size)) * np.fft.rfft(b, size), size)[:count]
     b_energy = np.concatenate(([0.0], np.cumsum(b * b)))
     r = raw / np.sqrt(np.dot(a, a) * (b_energy[seg:seg + count] - b_energy[:count]) + 1e-30)
 
-    # A repeating sound gives several near-equal peaks; of those, take the one closest to no shift
+    # Of several near-equal peaks (a repeating sound), take the one closest to no shift
     best = r.max()
     near_best = np.flatnonzero(r >= best - 0.02 * abs(best))
     left = np.concatenate(([-np.inf], r[:-1]))[near_best]
@@ -378,10 +323,9 @@ def find_lag(original: np.ndarray, converted: np.ndarray, max_lag_limit: int) ->
 
 
 def prepare(ao: Audio, ac: Audio, trim_begin: float, trim_end: float) -> Pair:
-    """Makes an original signal and its converted copy comparable: cuts the
-    original to the trim range (seconds from its start; negative = not set),
-    lines the converted one up against it and crops both to the range they
-    share. Both are changed in place."""
+    """Cuts the original to the trim range (seconds; negative = not set), lines
+    the converted copy up against it and crops both to the range they share.
+    Both are changed in place."""
     if len(ao.samples) == 0:
         raise AnalysisError("The original file contains no audio.")
     if len(ac.samples) == 0:
@@ -392,7 +336,7 @@ def prepare(ao: Audio, ac: Audio, trim_begin: float, trim_end: float) -> Pair:
     full_duration = ao.duration
     converted_duration = ac.duration
     if ac.sample_rate != ao.sample_rate:
-        # Compared at the original's rate, so that both are measured over the same windows and can be lined up
+        # Compared at the original's rate, so both are measured over the same windows
         facts["Resampling"] = f"Converted file brought from {ac.sample_rate} to {ao.sample_rate} Hz for the comparison"
         ac.samples = resample(ac.samples, ac.sample_rate, ao.sample_rate)
         ac.sample_rate = ao.sample_rate
@@ -417,8 +361,8 @@ def prepare(ao: Audio, ac: Audio, trim_begin: float, trim_end: float) -> Pair:
     else:
         facts["Trim"] = "None; the whole original is used"
 
-    # 2. The converted file should now be as long as the cut original. The warnings are shown in the report,
-    # so they say only that the comparison is in doubt and what to do; the figures behind them are in `facts`.
+    # 2. The converted file should now be as long as the cut original. Warnings go in the report, so
+    # they say only what to do; the figures behind them are in `facts`.
     mismatch = converted_duration - trimmed_duration
     facts["Length"] = f"Converted is {mismatch * 1000:+.1f} ms against the {which}"
     if abs(mismatch) > LENGTH_TOLERANCE_SECONDS:
@@ -464,15 +408,11 @@ def prepare(ao: Audio, ac: Audio, trim_begin: float, trim_end: float) -> Pair:
 
 
 def pair_channels(original: WavFile, converted: WavFile, trim_begin: float) -> Optional[List[int]]:
-    """For each channel of the original, the channel of the converted file
-    that carries it; None if that cannot be told. The files must have the
-    same number of channels.
+    """For each channel of the original, the converted channel that carries
+    it; None if that cannot be told. Needs equal channel counts.
 
-    A conversion may reorder channels (Wwise does with ambisonics), so they
-    are paired by what they contain, not by where they sit: a stretch from
-    the middle of every original channel is matched against the same stretch
-    of every converted one, and the best matches win. Where two matches are
-    as good as each other, a channel keeps its place."""
+    Paired by content, not position, as a conversion may reorder channels
+    (Wwise does with ambisonics). Of equal matches, a channel keeps its place."""
     count = original.channels
     original_parts, converted_parts = matching_stretches(original, converted, trim_begin)
     matches = []
@@ -484,7 +424,7 @@ def pair_channels(original: WavFile, converted: WavFile, trim_begin: float) -> O
             matches.append((round(abs(found[1]), 3), k == j, k, j))
 
     partners: List[Optional[int]] = [None] * count
-    for correlation, _, k, j in sorted(matches, reverse=True):  # best first; of equals, a channel keeps its place
+    for correlation, _, k, j in sorted(matches, reverse=True):  # best first
         if correlation < MIN_CORRELATION:
             break
         if partners[k] is None and j not in partners:
@@ -493,11 +433,10 @@ def pair_channels(original: WavFile, converted: WavFile, trim_begin: float) -> O
 
 
 def matching_stretches(original: WavFile, converted: WavFile, trim_begin: float) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    """The same stretch of audio from the middle of every channel of each
-    file, for telling which channel carries what. The converted ones are
-    brought to the original's sample rate."""
+    """The same stretch from the middle of every channel of each file, the
+    converted ones brought to the original's sample rate."""
     seconds = min(PAIRING_SECONDS, converted.duration)
-    start = (converted.duration - seconds) / 2  # in the converted file, which begins where the trim range does
+    start = (converted.duration - seconds) / 2  # the converted file begins where the trim range does
 
     def stretch(wav: WavFile, begin: float, channel: int) -> np.ndarray:
         first = round(begin * wav.sample_rate)
@@ -510,14 +449,10 @@ def matching_stretches(original: WavFile, converted: WavFile, trim_begin: float)
 
 
 def find_mixes(original: WavFile, converted: WavFile, trim_begin: float) -> Optional[List[List[float]]]:
-    """For a converted file with a different number of channels from its
-    original: what each converted channel was made from. mixes[j][k] is how
-    much of original channel k is in converted channel j (1 = all of it,
-    0 = none); None if that cannot be told.
-
-    Found from the audio itself, so it is what the conversion did, whatever
-    its settings say: each converted channel is fitted as a weighted sum of
-    the original's channels."""
+    """For a changed channel count: mixes[j][k] is how much of original
+    channel k is in converted channel j (1 = all, 0 = none); None if that
+    cannot be told. Found from the audio, by fitting each converted channel
+    as a weighted sum of the original's channels."""
     original_parts, converted_parts = matching_stretches(original, converted, trim_begin)
     mixes = []
     for part in converted_parts:
@@ -531,9 +466,8 @@ def find_mixes(original: WavFile, converted: WavFile, trim_begin: float) -> Opti
         sources = [p[max(0, -lag):] for p in original_parts]
         target = part[max(0, lag):]
         length = min(len(target), min(len(source) for source in sources))
-        # Fitted over the part of the spectrum where the converted channel has most of its energy. A
-        # conversion takes the top off (a lower sample rate, a codec's cutoff), and audio that is in the
-        # original but no longer in the converted file would make every share come out too small.
+        # Fitted only where the converted channel has most of its energy: audio the conversion took
+        # off the top would otherwise make every share come out too small.
         frequencies = np.fft.rfftfreq(length, 1 / original.sample_rate)
         target_spectrum = np.fft.rfft(target[:length])
         energy = np.cumsum(np.where(frequencies >= FREQ_MIN, np.abs(target_spectrum) ** 2, 0.0))
@@ -552,7 +486,7 @@ def find_mixes(original: WavFile, converted: WavFile, trim_begin: float) -> Opti
         agreement = float(np.dot(fitted, wanted) / np.sqrt(np.dot(fitted, fitted) * np.dot(wanted, wanted) + 1e-30))
         if agreement < MIN_CORRELATION:
             return None
-        # Shares too small to be anything but the fit chasing codec noise are left out
+        # Shares small enough to be codec noise are left out
         largest = float(np.max(np.abs(gains)))
         mixes.append([float(g) if abs(g) >= MIX_SHARE_FLOOR * largest else 0.0 for g in gains])
     return mixes
@@ -569,8 +503,7 @@ def hann_window(fft_size: int) -> np.ndarray:
 
 
 def window_powers(samples: np.ndarray, starts: np.ndarray, fft_size: int):
-    """Yields (index of first window, power spectra) for the analysis windows
-    beginning at `starts`, a block of windows at a time."""
+    """Yields (index of first window, power spectra) for the windows at `starts`, a block at a time."""
     window = hann_window(fft_size)
     offsets = np.arange(fft_size)
     for first in range(0, len(starts), BLOCK):
@@ -585,9 +518,8 @@ def spectrogram(audio: Audio, columns: int, rows: int, duration: float, fft_size
     bin_hz = audio.sample_rate / fft_size
     n = len(audio.samples)
 
-    # Each row is the mean of the linearly interpolated spectrum across the row's frequency span. That
-    # stays continuous from rows covering many FFT bins down to rows covering a fraction of one, so
-    # no row stands out as a line. c_lo and c_hi are the span's edges in (fractional) bins.
+    # Each row is the mean of the interpolated spectrum across its frequency span, which stays smooth
+    # whether a row covers many FFT bins or a fraction of one. c_lo and c_hi are the span's edges in bins.
     y = np.arange(rows)
     c_hi = np.minimum(half, FREQ_MIN * (f_max / FREQ_MIN) ** (1 - y / rows) / bin_hz)
     c_lo = np.minimum(half, FREQ_MIN * (f_max / FREQ_MIN) ** (1 - (y + 1) / rows) / bin_hz)
@@ -597,7 +529,7 @@ def spectrogram(audio: Audio, columns: int, rows: int, duration: float, fft_size
     above_nyquist = c_hi - c_lo < 1e-9
     width = np.maximum(c_hi - c_lo, 1e-9)
 
-    # Padding lets the windows at either end hang over the edges of the file
+    # Padded so the windows at either end can hang over the file's edges
     padded = np.concatenate((np.zeros(half), audio.samples, np.zeros(fft_size)))
     centres = np.minimum(n, ((np.arange(columns) + 0.5) / columns * duration * audio.sample_rate).astype(np.int64))
     grid = np.empty((rows, columns))
@@ -616,8 +548,7 @@ def spectrogram(audio: Audio, columns: int, rows: int, duration: float, fft_size
 
 
 def average_spectrum(samples: np.ndarray, fft_size: int) -> np.ndarray:
-    """Welch-averaged power spectrum (75% overlap). A file shorter than one
-    window is zero-padded."""
+    """Welch-averaged power spectrum (75% overlap); a short file is zero-padded."""
     if len(samples) < fft_size:
         samples = np.concatenate((samples, np.zeros(fft_size - len(samples))))
     starts = np.arange(0, len(samples) - fft_size + 1, fft_size // 4)
@@ -628,8 +559,7 @@ def average_spectrum(samples: np.ndarray, fft_size: int) -> np.ndarray:
 
 
 class Spectrum:
-    """A power spectrum with exact band averages of its linear interpolation,
-    so smoothed curves stay continuous."""
+    """A power spectrum with exact band averages of its linear interpolation."""
 
     def __init__(self, power: np.ndarray, bin_hz: float):
         self.power = power.tolist()
@@ -659,21 +589,18 @@ class Spectrum:
         return (self._integral(c_hi) - self._integral(c_lo)) / (c_hi - c_lo)
 
 
-# A cutoff at one end of the spectrum: (where the converted file has fallen 3 dB under the original,
-# where nothing of it is left). Either is None where that does not happen.
+# A cutoff at one end of the spectrum: (frequency 3 dB down, frequency where nothing is left), None if absent
 Cutoff = Tuple[Optional[float], Optional[float]]
 
 
 def find_cutoffs(freqs: List[float], difference: List[Optional[float]], unsmoothed: List[Optional[float]],
                  original_db: List[Optional[float]]) -> Tuple[Cutoff, Cutoff]:
-    """(low, high): the cutoffs at the bottom and the top of the spectrum.
+    """(low, high): the cutoffs at the bottom and top of the spectrum.
 
-    The 3 dB point is judged on the smoothed difference curve, against its
-    typical value, so an overall level change is not mistaken for a cutoff.
-    Where nothing is left (GONE_DB under) is read off the unsmoothed
-    difference, as smoothing carries the level on past a steep edge.
-    Frequencies where the original is itself below the quiet floor are left
-    out: there is nothing there to lose."""
+    The 3 dB point is judged on the smoothed difference against its median,
+    so a level change is not taken for a cutoff. "Nothing left" is read off
+    the unsmoothed difference, as smoothing carries a steep edge outward.
+    Frequencies where the original itself has nothing are left out."""
     floor_db = 10 * math.log10(QUIET_FLOOR)
     usable = [i for i, (d, u, o) in enumerate(zip(difference, unsmoothed, original_db))
               if d is not None and u is not None and o is not None and o > floor_db]
@@ -682,7 +609,7 @@ def find_cutoffs(freqs: List[float], difference: List[Optional[float]], unsmooth
     typical = statistics.median(difference[i] for i in usable)
 
     def edge(values: List[Optional[float]], limit: float, indices: List[int]) -> Optional[float]:
-        """Walks inward from one end of the range to where the values come back above the limit."""
+        """Walks inward from one end to where the values come back above the limit."""
         if values[indices[0]] >= limit:
             return None
         for outer, inner in zip(indices, indices[1:]):
@@ -704,7 +631,7 @@ class Analysis:
     f_max: float
     columns: int
     rows: int
-    # The spectrogram grids, which are let go of (set to None) once the images have been made from them
+    # Spectrogram grids, set to None once the images have been made from them
     grid_original: Optional[np.ndarray]  # power, shape (rows, columns), row 0 = f_max
     grid_converted: Optional[np.ndarray]
     grid_difference: Optional[np.ndarray]  # dB, converted minus original
@@ -712,10 +639,10 @@ class Analysis:
     curve_original: List[Optional[float]]
     curve_converted: List[Optional[float]]
     curve_difference: List[Optional[float]]
-    low_cutoff: Cutoff  # where the converted file falls away at the bottom of the spectrum
-    cutoff: Cutoff  # the same at the top
+    low_cutoff: Cutoff  # at the bottom of the spectrum
+    cutoff: Cutoff  # at the top
     band_hi: float  # top of the band both files fully cover, in Hz
-    band_difference: float  # level change across that band in dB; a check printed with --verbose
+    band_difference: float  # level change across that band in dB, for --verbose
     levels_original: Tuple[float, float]  # peak and RMS in dBFS
     levels_converted: Tuple[float, float]
 
@@ -784,10 +711,9 @@ DIVERGING_LUT = build_lut(DIVERGING_STOPS)
 
 
 def png_data_uri(indices: np.ndarray, lut: List[Tuple[int, int, int]]) -> str:
-    """A heat map as an RGB PNG, in the form a web page can embed. `indices`
-    holds a colour-map index per cell, shape (rows, columns)."""
+    """A heat map as an embeddable RGB PNG; `indices` is a colour-map index per cell, (rows, columns)."""
     rows, columns = indices.shape
-    raw = np.zeros((rows, 1 + 3 * columns), np.uint8)  # leading 0 on each row = PNG filter type "none"
+    raw = np.zeros((rows, 1 + 3 * columns), np.uint8)  # each row starts with PNG filter type 0 (none)
     raw[:, 1:] = np.asarray(lut, np.uint8)[indices].reshape(rows, 3 * columns)
 
     def chunk(tag: bytes, payload: bytes) -> bytes:
@@ -1008,12 +934,11 @@ PAGE_SCRIPT = """
 """
 
 PLOT_LEFT = 64
-# The spectrum chart and every spectrogram share this width, so they line up on the page. A spectrogram's
-# width and height follow its cells, so the images are made at the shape they are shown at.
+# Shared by the spectrum chart and the spectrograms, so they line up; images are made at the shape shown
 PLOT_WIDTH = BASE_COLUMNS
 PANEL_HEIGHT = BASE_ROWS
 SPECTRUM_HEIGHT = 300  # the spectrum chart's level panel
-# Every figure is this wide, which leaves room to the right of the plot for a spectrogram's colour bar
+# Leaves room to the right of the plot for a colour bar
 FIGURE_WIDTH = PLOT_LEFT + PLOT_WIDTH + 110
 
 
@@ -1061,10 +986,9 @@ def gradient(name: str, stops) -> str:
 def heat_figure(kind: str, panels: List[Tuple[str, str]], panel_height: int, pair: Pair, analysis: Analysis,
                 bar_gradient: str, bar_stops, bar_labels: List[str], bar_title: str,
                 value_range: Tuple[float, float], lut_name: str, readout_id: str) -> str:
-    """One or more stacked heat maps, each with its own time and frequency
-    axes, sharing a colour bar."""
+    """Stacked heat maps, each with its own axes, sharing a colour bar."""
     width = PLOT_WIDTH
-    top0, gap = 24, 78  # the gap holds one panel's time axis and the next panel's caption
+    top0, gap = 24, 78  # the gap holds a time axis and the next panel's caption
     tops = [top0 + i * (panel_height + gap) for i in range(len(panels))]
     bottom = tops[-1] + panel_height
     height = bottom + 52
@@ -1111,8 +1035,8 @@ def heat_figure(kind: str, panels: List[Tuple[str, str]], panel_height: int, pai
 
 
 def spectrum_figure(analysis: Analysis, readout_id: str, key: str) -> str:
-    """Average spectrum of both files, with the smoothed difference in a second
-    panel below. `key` is added to the figure's ids, which must be unique in the page."""
+    """Average spectrum of both files, with the smoothed difference in a panel
+    below. `key` keeps the figure's ids unique in the page."""
     width, main_top, main_height, gap, diff_height, diff_range = PLOT_WIDTH, 24, SPECTRUM_HEIGHT, 46, 120, 3.0
     diff_top = main_top + main_height + gap
     main_bottom, diff_bottom = main_top + main_height, diff_top + diff_height
@@ -1159,7 +1083,7 @@ def spectrum_figure(analysis: Analysis, readout_id: str, key: str) -> str:
         db -= 20
     for step in range(int(diff_range), -int(diff_range) - 1, -1):
         y = y_diff(step)
-        if step > -diff_range:  # the bottom edge is drawn as the panel's baseline below
+        if step > -diff_range:  # the bottom edge is the panel's baseline, drawn below
             out.append(f'<line class="{"axis" if step == 0 else "grid"}" x1="{PLOT_LEFT}" y1="{y:.1f}" x2="{right}" y2="{y:.1f}"/>')
         out.append(f'<text x="{PLOT_LEFT - 10}" y="{y + 4:.1f}" text-anchor="end">{minus(step, 0, signed=True)}</text>')
     out.append(f'<line class="axis" x1="{PLOT_LEFT}" y1="{main_bottom}" x2="{right}" y2="{main_bottom}"/>')
@@ -1183,7 +1107,7 @@ def spectrum_figure(analysis: Analysis, readout_id: str, key: str) -> str:
     return "".join(out)
 
 
-# (label, value) rows. A value is text, or a list of (label, value) lines shown one per line.
+# (label, value) rows; a value is text, or a list of (label, value) lines
 Rows = List[Tuple[str, object]]
 
 
@@ -1200,8 +1124,7 @@ def table(rows: Rows) -> str:
 
 
 def side_by_side(rows: Rows) -> str:
-    """The rows as columns headed by their labels, one line of each value per
-    table row, so that the same line of every value can be compared across."""
+    """The rows as columns headed by their labels, so the same line of each value sits level."""
     head = "".join(f"<th>{esc(label)}</th>" for label, _ in rows)
     body = "".join("<tr>" + "".join(f"<td>{esc(line)}</td>" for line in lines) + "</tr>"
                    for lines in zip(*(row_lines(value) for _, value in rows)))
@@ -1209,9 +1132,8 @@ def side_by_side(rows: Rows) -> str:
 
 
 def cutoff_label(cutoff: Cutoff, beyond: str) -> str:
-    """A cutoff as the report shows it, such as "4.5 kHz (nothing above 4.8 kHz)";
-    `beyond` is "above" or "below". Frequencies are given to the nearest
-    100 Hz from 1 kHz up, 10 Hz from 100 Hz up, otherwise 1 Hz."""
+    """A cutoff as shown, such as "4.5 kHz (nothing above 4.8 kHz)"; `beyond`
+    is "above" or "below". Rounded to 100 Hz from 1 kHz, 10 Hz from 100 Hz, else 1 Hz."""
     def rounded(f: float) -> str:
         step = 100 if f >= 1000 else 10 if f >= 100 else 1
         return hz_label(round(f / step) * step)
@@ -1223,9 +1145,8 @@ def cutoff_label(cutoff: Cutoff, beyond: str) -> str:
 
 
 def clipping_label(original: int, converted: int, compact: bool = False) -> str:
-    """Whether the converted audio clips, as the report shows it. The counts
-    are of samples in flat spots at full scale. `compact` gives the short
-    wording used where several channels share a table."""
+    """Whether the converted audio clips, from counts of samples in flat spots
+    at full scale. `compact` is the short wording for the channel table."""
     def count(samples: int) -> str:
         return "none" if samples == 0 else f"{samples:,} sample{'' if samples == 1 else 's'}"
 
@@ -1239,30 +1160,27 @@ def clipping_label(original: int, converted: int, compact: bool = False) -> str:
 @dataclass
 class View:
     """One comparison shown in the report: every channel mixed to mono, or one channel on its own."""
-    name: str  # the channel's name; empty in a report that has a single view
-    # In words: where the channel sits in the original and in the converted file or, where the converted
-    # file has a different number of channels, which of the original's channels this one was made from
-    place: str
+    name: str  # the channel's name; empty for a single view
+    place: str  # where the channel sits in each file, or which original channels it was made from
     pair: Pair
     analysis: Analysis
-    clipped: Tuple[int, int]  # clipped samples in the original and in the converted file, in what this view covers
+    clipped: Tuple[int, int]  # clipped samples in the original and the converted file
     images: Dict[str, str]  # the spectrogram images, ready to embed
 
 
 def size_row(item: "Item") -> Tuple[str, str]:
     original_size, converted_size = os.path.getsize(item.original), os.path.getsize(item.converted)
-    # Both figures come from the same rounded percentage, so they always add up to 100
+    # Both figures come from one rounded percentage, so they add up to 100
     percent = round(100 * converted_size / max(1, original_size), 1)
     change = f"{100 - percent:.1f}% reduction" if percent <= 100 else f"{percent - 100:.1f}% larger"
     return "Converted size", f"{percent:.1f}% of original file ({change})"
 
 
 def key_rows(view: View, compact: bool = False) -> Rows:
-    """The key numbers of one view. The report and the tool's own output both
-    show exactly these, so the two cannot drift apart. `compact` gives the
-    short wording used where several channels share a table."""
+    """The key numbers of one view, shown by both the report and the log.
+    `compact` is the short wording for the channel table."""
     def levels(original: float, converted: float) -> str:
-        # The difference is taken from the rounded figures, so it agrees with the two numbers beside it
+        # The difference is of the rounded figures, so it agrees with the numbers beside it
         original, converted = round(original, 1), round(converted, 1)
         difference = minus(converted - original, signed=True)
         if compact:
@@ -1278,10 +1196,9 @@ def key_rows(view: View, compact: bool = False) -> Rows:
 
 
 def channel_table(views: List[View], position_label: str) -> str:
-    """The key numbers of every channel in one table: a column per channel or,
-    when there are too many for that, a row per channel. `position_label`
-    heads the line saying where each channel sits in the two files; empty
-    leaves that line out."""
+    """Every channel's key numbers in one table: a column per channel, or a
+    row each when there are too many. `position_label` heads the line saying
+    where each channel sits; empty leaves that line out."""
     labels = ([position_label] if position_label else []) + [label for label, _ in key_rows(views[0], compact=True)]
     cells = [([view.place] if position_label else []) + [str(value) for _, value in key_rows(view, compact=True)]
              for view in views]
@@ -1297,8 +1214,8 @@ def channel_table(views: List[View], position_label: str) -> str:
 
 
 def view_sections(view: View, key: str, range_db: float) -> str:
-    """The Spectrum and Spectrograms sections of one view, followed by the data
-    their hover readouts use. `key` is added to the ids, which must be unique in the page."""
+    """One view's Spectrum and Spectrograms sections, then the data their
+    hover readouts use. `key` keeps the ids unique in the page."""
     pair, analysis, images = view.pair, view.analysis, view.images
     difference_labels = [f"\u2265 {db_tick(range_db, True)}", db_tick(range_db / 2, True), "0",
                          db_tick(-range_db / 2, True), f"\u2264 {db_tick(-range_db, True)}"]
@@ -1334,21 +1251,20 @@ class SoundReport:
     information: str  # the inside of the Conversion Information section
     views: List[View]  # one, or one per channel
     notes: str  # sentences for the footer, each starting with a space
-    digest: str  # the conversion in a line: what the Sound was converted as, and to what size
+    digest: str  # the conversion in one line
 
 
 def tab_row(panels: str, names: List[str]) -> str:
-    """A row of tabs, one per name. Each shows the element beside the row that
-    has the class `panels` and the tab's place in the row as its data-key."""
+    """A row of tabs, one per name; each shows the sibling of class `panels`
+    whose data-key is the tab's place in the row."""
     return (f'<div class="tabs" data-panels="{panels}">'
             + "".join(f'<button type="button" data-key="{key}">{esc(name)}</button>' for key, name in enumerate(names))
             + "</div>")
 
 
 def sound_block(sound: SoundReport, title: str, key: str, range_db: float) -> str:
-    """One Sound's part of the page: its warnings, summary, charts and footer.
-    With more than one view, each gets a tab. `key` is added to the ids of the
-    figures, which must be unique in the page."""
+    """One Sound's part of the page: warnings, summary, charts and footer, with
+    a tab per view if there are several. `key` keeps the ids unique in the page."""
     views = sound.views
     warning_box = ""
     if sound.warnings:
@@ -1375,9 +1291,8 @@ def sound_block(sound: SoundReport, title: str, key: str, range_db: float) -> st
 
 
 def build_page(title: str, sounds: List[SoundReport], range_db: float) -> str:
-    """The whole report. `title` is the tool's name as the menu entry that made
-    the report shows it. A report on several Sounds gives each a tab, holding
-    what its own report would."""
+    """The whole report; `title` is the tool's name as the menu entry shows it.
+    Several Sounds get a tab each."""
     if len(sounds) == 1:
         subject, tabs = sounds[0].name, ""
         key = [""]
@@ -1428,7 +1343,7 @@ class Item:
     sound_id: str = ""
     language: str = ""
     platform: str = ""
-    channels_setting: str = ""  # the Channels option Wwise converts the Sound with, by name; empty if not known
+    channels_setting: str = ""  # the Channels option of the Sound's conversion settings; empty if not known
     notes: List[str] = field(default_factory=list)  # lines to print about how the item was obtained
 
 
@@ -1438,10 +1353,15 @@ SOURCE_FIELDS = ["type", "originalFilePath", "convertedFilePath", "audioSource:t
 
 
 def read_wwise_item(client, target: Optional[str]) -> Item:
-    """Returns the Sound's active source files and the trim range Wwise applies at conversion."""
+    """The Sound's active source files and trim, for the platform selected in Wwise."""
+    # Platforms may differ in settings, source and converted file, so the selected one is named
+    project = client.call("ak.wwise.core.getProjectInfo", {})
+    platform = next((p["name"] for p in project["platforms"] if p["id"] == project["currentPlatformId"]), "")
+    on_platform = {"platform": platform} if platform else {}
     if target:
         key = "id" if target.startswith("{") else "path"
-        found = client.call("ak.wwise.core.object.get", {"from": {key: [target]}}, options={"return": SOUND_FIELDS})["return"]
+        found = client.call("ak.wwise.core.object.get", {"from": {key: [target]}},
+                            options={"return": SOUND_FIELDS, **on_platform})["return"]
         if not found:
             raise AnalysisError(f"No object found in Wwise for {target}.")
     else:
@@ -1455,12 +1375,11 @@ def read_wwise_item(client, target: Optional[str]) -> Item:
     if not active.get("id"):
         raise AnalysisError(f"'{sound['name']}' has no audio source.")
 
-    source = client.call("ak.wwise.core.object.get", {"from": {"id": [active["id"]]}}, options={"return": SOURCE_FIELDS})["return"][0]
+    source = client.call("ak.wwise.core.object.get", {"from": {"id": [active["id"]]}},
+                         options={"return": SOURCE_FIELDS, **on_platform})["return"][0]
     if not source.get("originalFilePath"):
         raise AnalysisError(f"The source of '{sound['name']}' is a {source.get('type')} with no original file to compare.")
     trim = source.get("audioSource:trimValues") or {}
-    project = client.call("ak.wwise.core.getProjectInfo", {})
-    platform = next((p["name"] for p in project["platforms"] if p["id"] == project["currentPlatformId"]), "")
     return Item(name=sound["name"], original=source["originalFilePath"], converted=source.get("convertedFilePath", ""),
                 trim_begin=float(trim.get("trimBegin", -1)), trim_end=float(trim.get("trimEnd", -1)),
                 fade_in=float(source.get("FadeInDuration") or 0), fade_out=float(source.get("FadeOutDuration") or 0),
@@ -1474,8 +1393,7 @@ CHANNELS_SETTINGS = {0: "Mono", 1: "Stereo", 2: "Mono Drop", 3: "Stereo Drop", 4
 
 
 def read_channels_setting(client, sound_id: str, platform: str) -> str:
-    """The Channels option of the conversion settings that Wwise applies to
-    the Sound on a platform, by name; empty if Wwise does not say."""
+    """The Channels option of the Sound's conversion settings on a platform; empty if Wwise does not say."""
     try:
         sound = client.call("ak.wwise.core.object.get", {"from": {"id": [sound_id]}},
                             options={"return": ["@@Conversion"]})["return"][0]
@@ -1488,15 +1406,14 @@ def read_channels_setting(client, sound_id: str, platform: str) -> str:
         settings = client.call("ak.wwise.core.object.get", {"from": {"id": [conversion]}}, options=options)["return"][0]
         return CHANNELS_SETTINGS.get(settings.get("@Channels"), "")
     except Exception:
-        # Only extra detail for the report, and an older Wwise may not answer; never a reason to fail
+        # Extra detail only, and an older Wwise may not answer; never a reason to fail
         return ""
 
 
 def resolve_from_wwise(target: Optional[str], convert_if_missing: bool, waapi_url: Optional[str]) -> Item:
-    """Reads the Sound from Wwise (`target` is its GUID or path, or None for
-    the selected Sound) and, if asked, has Wwise convert it when its converted
-    file is missing."""
-    # Imported here so that file mode works without waapi-client
+    """Reads the Sound from Wwise (`target` is its GUID or path; None = the
+    selected Sound) and, if asked, has Wwise convert it when unconverted."""
+    # Imported here so file mode works without waapi-client
     try:
         from waapi import WaapiClient, CannotConnectToWaapiException, WaapiRequestFailed
     except ImportError:
@@ -1525,8 +1442,7 @@ def resolve_from_wwise(target: Optional[str], convert_if_missing: bool, waapi_ur
 
 
 def find_vgmstream(given: Optional[str]) -> str:
-    """Path of vgmstream-cli: the one given, else the one beside this script,
-    else the one on the PATH."""
+    """Path of vgmstream-cli: the one given, else beside this script, else on the PATH."""
     if given:
         if not os.path.isfile(given):
             raise AnalysisError(f"vgmstream-cli not found at {given} (from --vgmstream).")
@@ -1544,12 +1460,11 @@ def find_vgmstream(given: Optional[str]) -> str:
 
 
 def decode_with_vgmstream(vgmstream: str, source: str, scratch: str) -> Tuple[str, str, str]:
-    """Decodes a .wem to a WAV in the scratch folder. Returns (path, codec, bit rate),
-    the last two as vgmstream reports them."""
+    """Decodes a .wem to a WAV in the scratch folder. Returns (path, codec, bit rate)."""
     decoded = os.path.join(scratch, "converted_decoded.wav")
     try:
-        # -i: decode the file once, as it is, whatever loop points it carries. stdin is closed off
-        # because Wwise starts this script without one, and inheriting that fails.
+        # -i: decode once, ignoring loop points. stdin is closed off, as Wwise starts this script
+        # without one and inheriting that fails.
         result = subprocess.run([vgmstream, "-i", "-o", decoded, source], capture_output=True, text=True,
                                 errors="replace", stdin=subprocess.DEVNULL, timeout=DECODE_TIMEOUT_SECONDS,
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -1567,10 +1482,9 @@ def decode_with_vgmstream(vgmstream: str, source: str, scratch: str) -> Tuple[st
 
 
 def wem_is_ambisonic(path: str) -> bool:
-    """Whether a converted file describes its channels as ambisonic. A .wem
-    keeps Wwise's channel configuration where a WAV keeps its channel mask:
-    the channel count in bits 0-7 and the kind in bits 8-11, 2 being
-    ambisonic. Anything that is not such a file is simply not ambisonic."""
+    """Whether a .wem describes its channels as ambisonic. Where a WAV keeps
+    its channel mask, a .wem keeps Wwise's channel configuration: the count
+    in bits 0-7 and the kind in bits 8-11 (2 = ambisonic)."""
     try:
         with open(path, "rb") as file:
             data = file.read(4096)  # the fmt chunk is at the start of the file
@@ -1591,12 +1505,9 @@ def wem_is_ambisonic(path: str) -> bool:
 
 
 def channel_names(original: WavFile, partners: List[int], ambisonic: bool) -> List[str]:
-    """What each channel of the original is called in the report.
-    `partners` gives, for each, the converted channel that carries it.
-
-    Ambisonic channels go by letter, never by number. The letter comes from
-    the channel's place in the converted file, because that order is Wwise's
-    own and so is known, whichever convention the original was written in."""
+    """The report's name for each channel of the original; `partners` gives
+    the converted channel that carries each. Ambisonic channels go by letter,
+    taken from their place in the converted file, whose order (Wwise's) is known."""
     count = original.channels
     if ambisonic:
         return [AMBISONIC_LETTERS[j] if j < len(AMBISONIC_LETTERS) else f"ACN {j}" for j in partners]
@@ -1657,23 +1568,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def write_report(page: str, output_dir: Optional[str], sounds: List[SoundReport], suffix: str) -> Path:
-    """Writes the report and returns where it went.
-
-    With no folder asked for, that is the one page in the temp folder, which
-    every run writes over, whether or not a browser has it open.
-
-    With a folder asked for, the report is kept there under the name of its
-    Sound, or of the first of several and how many more there are; `suffix`
-    tells the kinds of report apart."""
+    """Writes the report and returns its path: by default the one page in the
+    temp folder, written over on every run; with `output_dir`, a file there
+    named after its Sound(s), `suffix` telling the kinds of report apart."""
     path = REPORT_PATH
     if output_dir:
         name = sounds[0].name + (f" and {len(sounds) - 1} more" if len(sounds) > 1 else "")
         safe = "".join("_" if ch in '\\/:*?"<>|' or ord(ch) < 32 else ch for ch in name).strip(" .") or "Sound"
         path = Path(output_dir) / f"{safe}_ConversionAnalysis{suffix}.html"
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Written straight over the page that is there, which Windows allows while another program has it open
-    # for reading; swapping a new file into its place is refused then. A second try covers a virus scanner
-    # or indexer that has the last page locked for a moment.
+    # Written in place, which Windows allows while a browser has the page open (replacing the file is
+    # refused then). The second try covers a scanner or indexer holding it for a moment.
     try:
         path.write_text(page, encoding="utf-8")
     except OSError:
@@ -1688,8 +1593,7 @@ def make_view(args: argparse.Namespace, item: Item, scale: int, name: str, place
     pair = prepare(original, converted, item.trim_begin, item.trim_end)
     analysis = analyse(pair, args.window_size, scale)
     images = render_images(analysis, args.difference_range)
-    # Only the figures drawn from them are needed from here on. Kept, the audio and the spectrogram
-    # grids of every Sound and channel in a report would add up to a great deal of memory.
+    # The audio and grids are let go of now the figures are drawn, to keep memory down
     pair.original.samples = pair.converted.samples = np.empty(0)
     analysis.grid_original = analysis.grid_converted = analysis.grid_difference = None
     return View(name, place, pair, analysis, clipped, images)
@@ -1697,9 +1601,8 @@ def make_view(args: argparse.Namespace, item: Item, scale: int, name: str, place
 
 def channel_views(args: argparse.Namespace, item: Item, scale: int, original: WavFile,
                   converted: WavFile) -> Tuple[List[View], str, List[str]]:
-    """One view per channel of a file. Returns the views, the label for the
-    line saying where each channel sits in the two files (empty if none
-    moved) and any warnings about the pairing."""
+    """One view per channel. Returns the views, the label for the line saying
+    where each channel sits (empty if none moved) and any pairing warnings."""
     count = original.channels
     warnings = []
     partners = pair_channels(original, converted, item.trim_begin)
@@ -1709,7 +1612,7 @@ def channel_views(args: argparse.Namespace, item: Item, scale: int, original: Wa
                         "compared in file order.")
     ambisonic = wem_is_ambisonic(item.converted)
     names = channel_names(original, partners, ambisonic)
-    # Ambisonic channels are listed in the order Wwise keeps and shows them, others in the original file's
+    # Ambisonic channels are listed in Wwise's order, others in the original file's
     order = sorted(range(count), key=partners.__getitem__) if ambisonic else range(count)
     views = []
     for k in order:
@@ -1727,11 +1630,9 @@ def channel_views(args: argparse.Namespace, item: Item, scale: int, original: Wa
 
 def mixed_views(args: argparse.Namespace, item: Item, scale: int, original: WavFile,
                 converted: WavFile) -> Optional[Tuple[List[View], Rows]]:
-    """For a converted file that has a different number of channels from its
-    original: one view per channel of the converted file, each compared with
-    the mix of the original's channels that it was made from. Returns the
-    views and further lines for the report's summary; None if what the
-    converted channels were made from cannot be told."""
+    """For a changed channel count: one view per converted channel, each
+    compared with the mix of original channels it was made from. Returns the
+    views and extra summary lines; None if the mixes cannot be told."""
     mixes = find_mixes(original, converted, item.trim_begin)
     if mixes is None:
         return None
@@ -1758,12 +1659,11 @@ def mixed_views(args: argparse.Namespace, item: Item, scale: int, original: WavF
 
 def analyse_sound(args: argparse.Namespace, target: Optional[str], title: str, full_resolution: bool,
                   say: Callable[[str], None]) -> SoundReport:
-    """Analyses one Sound (`target` is its GUID or path, or None for the Sound
-    selected in Wwise) or, in file mode, the two files given. What the report
-    will show of it is also handed, a line at a time, to `say`, for the
-    script's own output. `title` is the tool's name as the menu entry that ran
-    it shows it. `full_resolution` is False where the report covers so many
-    Sounds that its spectrograms are better made smaller."""
+    """Analyses one Sound (`target` is its GUID or path; None = the selected
+    Sound) or, in file mode, the two files given. What the report shows is
+    also handed to `say`, a line at a time, for the script's output. `title`
+    is the tool's name as the menu entry shows it; `full_resolution` is False
+    when the report covers too many Sounds for full-size spectrograms."""
     started = time.perf_counter()
     if args.original or args.converted:
         if not (args.original and args.converted):
@@ -1772,7 +1672,6 @@ def analyse_sound(args: argparse.Namespace, target: Optional[str], title: str, f
                     converted=str(Path(args.converted).resolve()), trim_begin=args.trim_begin, trim_end=args.trim_end)
     else:
         item = resolve_from_wwise(target, args.convert_if_missing, args.waapi_url)
-    # Says which script this output is from, in the same form as the other AndyGBass commands' headers
     say(f"\n=== {title}: {item.name} ===")
     for note in item.notes:
         say(note)
@@ -1782,7 +1681,7 @@ def analyse_sound(args: argparse.Namespace, target: Optional[str], title: str, f
         raise AnalysisError(f"Converted file not found: {item.converted or '(Wwise gave no path)'}. "
                             "Convert the Sound in Wwise (or pass --convert-if-missing), then run this again.")
 
-    # The decoded audio only ever exists inside this folder, which is removed on the way out
+    # The decoded audio exists only in this folder, which is removed on the way out
     with tempfile.TemporaryDirectory(prefix=f"{TOOL_NAME}_") as scratch:
         codec, bit_rate, decoded, decoder = "", "", item.converted, ""
         if Path(item.converted).suffix.lower() != ".wav":
@@ -1799,9 +1698,8 @@ def analyse_sound(args: argparse.Namespace, target: Optional[str], title: str, f
         notes += (f" Converted file resampled from {converted.sample_rate / 1000:g} kHz to "
                   f"{original.sample_rate / 1000:g} kHz for the comparison.")
 
-    # A per-channel report follows the channels of the converted file. When it has as many as the original,
-    # each is compared with the original channel it carries; when it has fewer or more, with the mix of
-    # original channels it was made from.
+    # A per-channel report follows the converted file's channels: with as many as the original, each is
+    # compared with the original channel it carries; otherwise with the mix it was made from.
     per_channel = args.per_channel and max(original.channels, converted.channels) > 1
     scale = args.scale or (2 if full_resolution and not (per_channel and converted.channels > MAX_CHANNEL_COLUMNS) else 1)
     mixed = None
@@ -1815,8 +1713,10 @@ def analyse_sound(args: argparse.Namespace, target: Optional[str], title: str, f
             warnings.append(f"The original has {channels(original.channels)} and the converted file "
                             f"{channels(converted.channels)}, and what the converted ones were made from could not "
                             "be worked out. All channels are mixed to mono instead.")
-    extra: Rows = []  # lines of the summary beyond the file details and the size
-    place_label, place_prefix = "", ""  # what a channel's `place` says, in the report's table and in the output
+    extra: Rows = []  # summary lines beyond the file details and the size
+    # Shown last in the summary; not known for files compared without Wwise
+    platform: Rows = [("Platform", item.platform)] if item.platform else []
+    place_label, place_prefix = "", ""  # what a channel's `place` says, in the table and in the output
     if mixed:
         views, extra = mixed
         place_label, place_prefix = "Made from (channels of the original)", "made from "
@@ -1831,15 +1731,16 @@ def analyse_sound(args: argparse.Namespace, target: Optional[str], title: str, f
     else:
         views = [make_view(args, item, scale, "", "", mono_mix(original), mono_mix(converted),
                            (sum(original.clipped), sum(converted.clipped)))]
-        information = side_by_side(files) + table([size] + key_rows(views[0]))
+        information = side_by_side(files) + table([size] + key_rows(views[0]) + platform)
         if max(original.channels, converted.channels) > 1:
             notes += " Each file's channels are mixed to mono for the analysis."
-    # A warning that every channel gives is shown once; one that only some give says which
+    if (mixed or per_channel) and platform:
+        information += table(platform)  # under the table of channels, which holds the cutoffs here
+    # A warning every channel gives is shown once; one that only some give says which
     shared = [w for w in views[0].pair.warnings if all(w in view.pair.warnings for view in views)]
     warnings += shared + [f"{view.name}: {w}" for view in views for w in view.pair.warnings if w not in shared]
 
-    # The output shows what the report shows, in plain characters: Wwise's log garbles the report's
-    # minus and multiplication signs
+    # The output shows what the report shows, in plain characters, as Wwise's log garbles the others
     def plain(text: str) -> str:
         return text.replace("−", "-").replace("×", "x")
 
@@ -1866,6 +1767,7 @@ def analyse_sound(args: argparse.Namespace, target: Optional[str], title: str, f
                       + ("none" if down_3db is None else f"{down_3db:.1f} Hz")
                       + ("" if gone is None else f"; nothing left ({GONE_DB:g} dB below it) from {gone:.1f} Hz"))
             say(f"{indent}Mean level change {FREQ_MIN:.0f}-{analysis.band_hi:.0f} Hz: {analysis.band_difference:+.2f} dB")
+    show(platform)
     for warning in warnings:
         say(f"WARNING: {warning}")
     if args.verbose:
@@ -1875,16 +1777,15 @@ def analyse_sound(args: argparse.Namespace, target: Optional[str], title: str, f
         say(f"Took {time.perf_counter() - started:.1f} s (window {args.window_size} samples; "
             f"{views[0].analysis.columns} x {views[0].analysis.rows} cells; {len(views)} "
             f"view{'' if len(views) == 1 else 's'})")
-    # The Sound in a line, for when the script's output has to be kept short
+    # The Sound in one line, for when the output has to be kept short
     made = dict(files[1][1])
     digest = f"{made['Codec']}, {made['Bit-Rate']}, {made['Sample Rate']}, {made['Channels']}; {size[1]}"
     return SoundReport(item.name, warnings, information, views, notes, digest)
 
 
 def default_browser() -> Optional[str]:
-    """Path of the program Windows uses for web links, or None. Asked for
-    directly because .html files are often set to open in something else,
-    such as an editor."""
+    """Path of the program Windows uses for web links, or None. Looked up
+    directly, as .html files are often set to open in an editor."""
     if sys.platform != "win32":
         return None
     try:
@@ -1914,18 +1815,17 @@ def open_report(page_path: Path) -> str:
     return "WARNING: no browser could be started. Open the report from the path above."
 
 
-# An output pipe that nobody is reading takes this many bytes before whoever writes to it is made to wait,
-# unless the pipe itself says otherwise. That much less than its size is used, to be on the safe side.
+# What an unread output pipe takes before its writer has to wait, unless the pipe says otherwise,
+# and how far under that size to stay
 DEFAULT_PIPE_BYTES = 4096
 PIPE_MARGIN_BYTES = 128
-# How long to wait for the output to be taken at the very end before giving up on it
+# How long to wait at the end for the output to be taken
 OUTPUT_WAIT_SECONDS = 5.0
 
 
 def pipe_room(stream) -> Optional[int]:
-    """How many bytes can be written to a stream before the writer is made to
-    wait, if nobody reads them meanwhile; None if there is no such limit (the
-    stream is a file)."""
+    """How many bytes a stream takes, unread, before its writer has to wait;
+    None if there is no limit (the stream is a file)."""
     try:
         descriptor = stream.fileno()
         mode = os.fstat(descriptor).st_mode
@@ -1939,7 +1839,7 @@ def pipe_room(stream) -> Optional[int]:
             import ctypes
             import msvcrt
             reported = ctypes.c_ulong(0)
-            # GetNamedPipeInfo(pipe, flags, out buffer size, in buffer size, instances); a pipe of any kind answers
+            # GetNamedPipeInfo(pipe, flags, out buffer size, in buffer size, instances); any pipe answers
             if ctypes.windll.kernel32.GetNamedPipeInfo(ctypes.c_void_p(msvcrt.get_osfhandle(descriptor)), None,
                                                        ctypes.byref(reported), None, None) and reported.value:
                 capacity = reported.value
@@ -1951,30 +1851,25 @@ def pipe_room(stream) -> Optional[int]:
 class Output:
     """What the script prints.
 
-    Wwise runs this script as a command and takes its output through a pipe,
-    which it reads only once the script has ended. A pipe holds a few
-    kilobytes; a script that writes more than that to a pipe nobody is
-    reading waits for ever, and the command seems to do nothing. So unless
-    someone is plainly reading as the script goes (it was started in a
-    console, or with --verbose), nothing is written until the end, and then no
-    more than the pipe can hold: everything if that fits, otherwise each
-    block's short form, with the report holding the rest."""
+    Wwise reads a command's output only once it has ended, through a pipe
+    that holds a few kilobytes; a script that writes more waits for ever. So
+    unless it is read as it goes (a console, or --verbose), the output is
+    held until the end and cut to what the pipe can hold: everything if that
+    fits, otherwise each block's short form."""
 
     def __init__(self, as_it_goes: bool):
         self.as_it_goes = as_it_goes
-        self.blocks: List[Tuple[List[str], List[str]]] = []  # for each block, its lines in full and in brief
+        self.blocks: List[Tuple[List[str], List[str]]] = []  # each block's lines, in full and in brief
 
     def add(self, full: List[str], brief: Optional[List[str]] = None) -> None:
-        """Takes a block of lines. `brief` is what to show of it instead when
-        there is not room for everything; if not given, the same lines."""
+        """Takes a block of lines; `brief` is shown instead when there is not room for everything."""
         if not self.as_it_goes:
             self.blocks.append((full, full if brief is None else brief))
         elif full:
             print("\n".join(full))
 
     def finish(self) -> bool:
-        """Writes whatever was held back. Returns False if it was not taken,
-        in which case the script must end without waiting for it."""
+        """Writes whatever was held back. Returns False if it was not taken."""
         if self.as_it_goes:
             return True
         room = pipe_room(sys.stdout)
@@ -1988,8 +1883,7 @@ class Output:
         if room is not None and size(lines) > room:
             lines = [line for _, brief in self.blocks for line in brief]
             if size(lines) > room:
-                # A selection so large that even a line per Sound is too much: the closing lines, which
-                # name the report, are kept, with as many of the first lines as there is room for
+                # Even a line per Sound is too much: keep the closing lines and as many of the first as fit
                 note, closing = "... the rest is left out here; the report has everything", lines[-2:]
                 kept: List[str] = []
                 for line in lines[:-2]:
@@ -2010,12 +1904,10 @@ class Output:
 
 def run(args: argparse.Namespace, output: Output) -> int:
     """Analyses everything asked for and writes the report. Returns the exit code."""
-    # The tool's name as the menu entry that ran it shows it
-    title = TOOL_NAME + (" (per-channel)" if args.per_channel else "")
+    title = TOOL_NAME + (" (per-channel)" if args.per_channel else "")  # as the menu entry shows it
     targets = args.objects or [None]
-    # A selection of several Sounds is not gone through in the output: it says that the tool ran on a
-    # multi selection and that the report was opened, and otherwise only what went wrong. The figures
-    # are in the report. --verbose still prints everything.
+    # For several Sounds the output says only that the tool ran, that the report opened and what
+    # went wrong; the figures are in the report. --verbose still prints everything.
     quiet = len(targets) > 1 and not args.verbose
     failed = False
     sounds: List[SoundReport] = []
@@ -2035,20 +1927,20 @@ def run(args: argparse.Namespace, output: Output) -> int:
             # A file that cannot be read: locked, no permission
             problems.append(f"ERROR: {e}")
         except Exception:
-            # Not expected. The traceback goes to the output so that it can be reported.
+            # Not expected; the traceback is printed so it can be reported
             problems.append(f"ERROR: unexpected problem{f' with {target}' if target else ''}; details follow.")
             problems.append(traceback.format_exc().rstrip())
         failed = failed or bool(problems)
         if quiet:
             output.add(problems)
         else:
-            # In brief, should the whole not fit: a line on the Sound and its warnings, or all of what went wrong
+            # In brief: a line on the Sound and its warnings, or all of what went wrong
             output.add(lines + problems, lines + problems if sound is None else
                        [f"{sound.name}: {sound.digest}"] + [f"  WARNING: {warning}" for warning in sound.warnings])
     if not sounds:
         return 1
 
-    # One report for everything that was selected, with a tab per Sound when there are several
+    # One report for the whole selection
     try:
         page_path = write_report(build_page(title, sounds, args.difference_range), args.output_dir, sounds,
                                  "_PerChannel" if args.per_channel else "")
@@ -2065,13 +1957,13 @@ def run(args: argparse.Namespace, output: Output) -> int:
 
 
 def main() -> int:
-    # Wwise captures the output through a pipe, whose encoding cannot show every character a Sound's name may hold
+    # Wwise's pipe may use an encoding that cannot show every character of a Sound's name
     sys.stdout.reconfigure(errors="replace", line_buffering=True)
     args = parse_args()
     output = Output(as_it_goes=args.verbose or sys.stdout.isatty())
     code = run(args, output)
     if not output.finish():
-        # Whoever has the output is not taking it. The report is written and open; all that is left is to end.
+        # The output is not being taken. The report is written and open, so just end.
         os._exit(code)
     return code
 
