@@ -1,0 +1,28 @@
+{
+    "commands": [
+        {
+            "id": "AndyGBass.WwiseConversionAnalyser",
+            "displayName": "WwiseConversionAnalyser",
+            "contextMenu": {
+                "visibleFor": "Sound",
+                "basePath": "AndyGBass"
+            },
+            "startMode": "MultipleSelectionSingleProcessSpaceSeparated",
+            "program": "py",
+            "args": "\"${CurrentCommandDirectory}\\WwiseConversionAnalyser\\WwiseConversionAnalyser.py\" --convert-if-missing ${id}",
+            "redirectOutputs": true
+        },
+        {
+            "id": "AndyGBass.WwiseConversionAnalyserPerChannel",
+            "displayName": "WwiseConversionAnalyser (per-channel)",
+            "contextMenu": {
+                "visibleFor": "Sound",
+                "basePath": "AndyGBass"
+            },
+            "startMode": "MultipleSelectionSingleProcessSpaceSeparated",
+            "program": "py",
+            "args": "\"${CurrentCommandDirectory}\\WwiseConversionAnalyser\\WwiseConversionAnalyser.py\" --per-channel --convert-if-missing ${id}",
+            "redirectOutputs": true
+        }
+    ]
+}
