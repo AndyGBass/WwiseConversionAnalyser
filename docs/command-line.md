@@ -19,6 +19,7 @@ Sound selected in Wwise is used.
 | `--window-size N` | Analysis window in samples (a power of two from 1024 to 32768; default 16384). Larger gives finer frequency detail and coarser timing. |
 | `--difference-range DB` | Colour range of the level-change image, in dB either side of no change (default 6). |
 | `--vgmstream PATH` | The `vgmstream-cli` to use, if it is not beside the script or on the `PATH`. |
+| `--at9tool PATH` | Sony's `at9tool`, which decodes ATRAC9 encoded for motion/haptics, if it is not in Wwise's `plugins` folder or on the `PATH`. |
 | `--waapi-url URL` | Address of the Wwise Authoring API, if not the default `ws://127.0.0.1:8080/waapi`. |
 | `--verbose` | Also print trim, alignment and timing details, as they happen. |
 | `--version` | Print the version and exit. |

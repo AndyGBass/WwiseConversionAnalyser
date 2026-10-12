@@ -12,6 +12,7 @@ Messages from the tool appear in Wwise's **Logs** view, on the **General** tab.
 | `numpy is required` or `waapi-client is required` | Run step 1 of the installation, using the same Python that `py` starts. |
 | `Could not connect to Wwise` | Enable the Wwise Authoring API (step 3 of the installation). If Wwise uses a WAMP port other than 8080, add `--waapi-url ws://127.0.0.1:PORT/waapi` to both `args` lines in `WwiseConversionAnalyser.json`. |
 | `vgmstream-cli is needed ... but was not found` | The `vgmstream-win64` folder is missing from the tool's folder. Copy the whole download again. |
+| `vgmstream could not decode ... Sony's at9tool can, but was not found` | The Sound is ATRAC9 encoded for motion/haptics, which only `at9tool.exe` decodes. Wwise has it in its `plugins` folder when a PlayStation platform is installed. If yours is somewhere else, add `--at9tool "PATH"` to both `args` lines in `WwiseConversionAnalyser.json`. |
 | `Converted file not found` | Wwise could not convert the Sound. Convert it in Wwise and look at the errors it reports. |
 | A yellow box headed "Check before trusting this comparison" | The converted file does not match the Sound as it is set up now, usually because it is out of date. Convert the Sound again and re-run. |
 | Nothing seems to happen with a large selection. | It is working. Each short Sound takes a second or two, long files longer, and Wwise shows no output until the end. |

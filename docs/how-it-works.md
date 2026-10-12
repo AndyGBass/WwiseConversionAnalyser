@@ -13,6 +13,11 @@ numbers can be relied on. The settings are constants at the top of `WwiseConvers
    [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)), decodes the converted `.wem` to a WAV file in a scratch folder, which is deleted
    as soon as the file has been read. Looping information is ignored, so the file is decoded once, as it is.
    A decode that has not finished in 60 seconds is abandoned.
+
+   vgmstream does not read ATRAC9 that was encoded for motion/haptics. Such a file is decoded with
+   `at9tool.exe` instead: Sony's own program, which Wwise converts ATRAC9 with and keeps in its `plugins`
+   folder. `at9tool` reads `.at9` files, so the `.wem`'s audio data is first copied into the scratch folder
+   under an `.at9` header. The report names the codec `ATRAC9 (haptics)`.
 3. **Cut to the trim.** The original is cut to the trim range, because that is the audio Wwise converted.
 4. **Match the sample rate.** If the converted file has a different sample rate, it is resampled to the
    original's, so that both are measured over the same stretches of time. The resampling resizes the signal's

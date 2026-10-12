@@ -6,7 +6,8 @@ selected Sound, as one web page with a tab per Sound.
 
 For each Sound (Sound SFX) it reads the original file and the converted file.
 If there is a Trim in Wwise, the Trim is replicated on the source and lines 
-them up for better comparison. The wems are decoded with vgmstream.
+them up for better comparison. The wems are decoded with vgmstream; ATRAC9
+encoded for motion/haptics, which it cannot read, with Wwise's own at9tool.
 The Analysis reports size, levels, clipping, cutoffs, spectrum and spectrograms.
 The files are summed to mono for the overall comparison, however there is a 
 per-channel option which compares every channel on its own.
@@ -1326,7 +1327,7 @@ def build_page(title: str, sounds: List[SoundReport], range_db: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Wwise and vgmstream
+# Wwise and the decoders
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -1344,6 +1345,7 @@ class Item:
     language: str = ""
     platform: str = ""
     channels_setting: str = ""  # the Channels option of the Sound's conversion settings; empty if not known
+    wwise_bin: str = ""  # the folder of Wwise's own programs; empty for files given directly
     notes: List[str] = field(default_factory=list)  # lines to print about how the item was obtained
 
 
@@ -1380,12 +1382,15 @@ def read_wwise_item(client, target: Optional[str]) -> Item:
     if not source.get("originalFilePath"):
         raise AnalysisError(f"The source of '{sound['name']}' is a {source.get('type')} with no original file to compare.")
     trim = source.get("audioSource:trimValues") or {}
+    # Where Wwise's own programs are, among them the at9tool it converts ATRAC9 with
+    directories = client.call("ak.wwise.core.getInfo", {}).get("directories") or {}
     return Item(name=sound["name"], original=source["originalFilePath"], converted=source.get("convertedFilePath", ""),
                 trim_begin=float(trim.get("trimBegin", -1)), trim_end=float(trim.get("trimEnd", -1)),
                 fade_in=float(source.get("FadeInDuration") or 0), fade_out=float(source.get("FadeOutDuration") or 0),
                 wwise_path=sound["path"], sound_id=sound["id"],
                 language=(source.get("audioSourceLanguage") or {}).get("name", ""), platform=platform,
-                channels_setting=read_channels_setting(client, sound["id"], platform))
+                channels_setting=read_channels_setting(client, sound["id"], platform),
+                wwise_bin=directories.get("bin", ""))
 
 
 # The Channels option of Wwise's conversion settings, by the number Wwise stores for it
@@ -1459,19 +1464,39 @@ def find_vgmstream(given: Optional[str]) -> str:
                         "or add it to the PATH; or pass --vgmstream.")
 
 
+def find_at9tool(given: Optional[str], wwise_bin: str) -> Optional[str]:
+    """Path of Sony's at9tool: the one given, else the one Wwise converts
+    ATRAC9 with (`wwise_bin` is the folder of Wwise's programs, empty if not
+    known), else the one on the PATH; None if there is none."""
+    if given:
+        if not os.path.isfile(given):
+            raise AnalysisError(f"at9tool not found at {given} (from --at9tool).")
+        return given
+    if wwise_bin:
+        candidate = Path(wwise_bin) / "plugins" / "at9tool.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("at9tool")
+
+
+def run_decoder(decoder: str, command: List[str], source: str) -> subprocess.CompletedProcess:
+    """Runs a decoder's command to its end. `decoder` is its name and
+    `source` the file being decoded, for the message if it cannot be run."""
+    try:
+        # stdin is closed off, as Wwise starts this script without one and inheriting that fails
+        return subprocess.run(command, capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL,
+                              timeout=DECODE_TIMEOUT_SECONDS, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired:
+        raise AnalysisError(f"{decoder} did not finish decoding {source} within {DECODE_TIMEOUT_SECONDS} seconds.")
+    except OSError as e:
+        raise AnalysisError(f"{decoder} could not be started ({command[0]}): {e}")
+
+
 def decode_with_vgmstream(vgmstream: str, source: str, scratch: str) -> Tuple[str, str, str]:
     """Decodes a .wem to a WAV in the scratch folder. Returns (path, codec, bit rate)."""
     decoded = os.path.join(scratch, "converted_decoded.wav")
-    try:
-        # -i: decode once, ignoring loop points. stdin is closed off, as Wwise starts this script
-        # without one and inheriting that fails.
-        result = subprocess.run([vgmstream, "-i", "-o", decoded, source], capture_output=True, text=True,
-                                errors="replace", stdin=subprocess.DEVNULL, timeout=DECODE_TIMEOUT_SECONDS,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except subprocess.TimeoutExpired:
-        raise AnalysisError(f"vgmstream did not finish decoding {source} within {DECODE_TIMEOUT_SECONDS} seconds.")
-    except OSError as e:
-        raise AnalysisError(f"vgmstream could not be started ({vgmstream}): {e}")
+    # -i: decode once, ignoring loop points
+    result = run_decoder("vgmstream", [vgmstream, "-i", "-o", decoded, source], source)
     if result.returncode != 0 or not os.path.exists(decoded):
         detail = (result.stdout.strip() or result.stderr.strip()).splitlines()
         raise AnalysisError(f"vgmstream could not decode {source} (exit code {result.returncode})"
@@ -1479,6 +1504,89 @@ def decode_with_vgmstream(vgmstream: str, source: str, scratch: str) -> Tuple[st
     info = dict(line.split(": ", 1) for line in result.stdout.splitlines() if ": " in line)
     encoding = info.get("encoding", "unknown codec").replace("Custom ", "").replace("Little Endian ", "")
     return decoded, encoding, info.get("bitrate", "unknown bitrate")
+
+
+# ATRAC9 in a .wem: Wwise's format tag for it, the GUID an .at9 file names the codec by, and the channel
+# layouts of the codec's vibration mode, which Wwise's "Encode for motion/haptics" option selects
+WEM_ATRAC9_TAG = 0xFFFC
+AT9_GUID = bytes.fromhex("d242e147ba368d4d88fc61654f8c836c")
+AT9_VIBRATION_LAYOUTS = (6, 7)
+
+
+def wem_as_at9(source: str, scratch: str) -> Optional[Tuple[str, str, str]]:
+    """Writes an ATRAC9 .wem to the scratch folder as an .at9 file, the form
+    at9tool reads: the same audio data under a different header. Returns
+    (path, codec, bit rate); None if the file is not an ATRAC9 .wem."""
+    data = Path(source).read_bytes()
+    if len(data) < 12 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return None
+    fmt = body = None
+    pos = 12
+    while pos + 8 <= len(data):
+        chunk_id, size = data[pos:pos + 4], struct.unpack_from("<I", data, pos + 4)[0]
+        if chunk_id == b"fmt ":
+            fmt = data[pos + 8:pos + 8 + size]
+        elif chunk_id == b"data":
+            body = data[pos + 8:pos + 8 + size]
+        pos += 8 + size + (size % 2)
+    if fmt is None or body is None or len(fmt) != 36 or struct.unpack_from("<H", fmt)[0] != WEM_ATRAC9_TAG:
+        return None
+
+    # After the fields every WAV has, the .wem gives the samples in a block, Wwise's channel configuration
+    # (with the speaker mask in bits 12 and up when the kind, in bits 8-11, is 1), the codec's own
+    # configuration, the length in samples and the samples of delay the encoder added
+    channels, sample_rate, byte_rate, block_align = struct.unpack_from("<HIIH", fmt, 2)
+    block_samples, configuration = struct.unpack_from("<HI", fmt, 18)
+    codec_configuration = fmt[24:28]
+    length, delay = struct.unpack_from("<II", fmt, 28)
+    channel_mask = configuration >> 12 if configuration >> 8 & 0xF == 1 else 0
+    # No loop points are written, so the file is decoded once, as it is
+    chunks = ((b"fmt ", struct.pack("<HHIIHHHHI", 0xFFFE, channels, sample_rate, byte_rate, block_align, 0, 34,
+                                    block_samples, channel_mask)
+               + AT9_GUID + struct.pack("<I", 1) + codec_configuration + bytes(4)),
+              (b"fact", struct.pack("<III", length, delay, delay)),
+              (b"data", body))
+    packed = b"".join(chunk_id + struct.pack("<I", len(payload)) + payload + bytes(len(payload) % 2)
+                      for chunk_id, payload in chunks)
+    at9 = os.path.join(scratch, "converted.at9")
+    Path(at9).write_bytes(b"RIFF" + struct.pack("<I", 4 + len(packed)) + b"WAVE" + packed)
+    # The channel layout is bits 1-3 of the codec configuration's second byte
+    haptics = codec_configuration[1] >> 1 & 7 in AT9_VIBRATION_LAYOUTS
+    return at9, "ATRAC9 (haptics)" if haptics else "ATRAC9", f"{round(byte_rate * 8 / 1000)} kbps"
+
+
+def decode_with_at9tool(at9tool: str, at9: str, source: str, scratch: str) -> str:
+    """Decodes the .at9 made from the .wem `source` to a WAV in the scratch folder and returns its path."""
+    decoded = os.path.join(scratch, "converted_decoded.wav")
+    result = run_decoder("at9tool", [at9tool, "-d", "-int24", at9, decoded], source)
+    if result.returncode != 0 or not os.path.exists(decoded):
+        # at9tool says what is wrong in its first line, then lists its options
+        detail = result.stdout.strip().splitlines()
+        raise AnalysisError(f"at9tool could not decode {source} (exit code {result.returncode})"
+                            + (f": {detail[0]}" if detail else "."))
+    return decoded
+
+
+def decode(source: str, scratch: str, vgmstream: Optional[str], at9tool: Optional[str],
+           wwise_bin: str) -> Tuple[str, str, str, str]:
+    """Decodes the converted file to a WAV in the scratch folder. Returns
+    (path, codec, bit rate, name of the decoder used). `vgmstream` and
+    `at9tool` are the paths given for them, if any."""
+    try:
+        return decode_with_vgmstream(find_vgmstream(vgmstream), source, scratch) + ("vgmstream",)
+    except AnalysisError as problem:
+        # vgmstream cannot read ATRAC9 encoded for motion/haptics. at9tool, which Wwise converts
+        # ATRAC9 with, can.
+        at9 = wem_as_at9(source, scratch)
+        if at9 is None:
+            raise
+        found = find_at9tool(at9tool, wwise_bin)
+        if found is None:
+            raise AnalysisError(f"{str(problem).rstrip('.')}. It is ATRAC9 of a kind vgmstream cannot read, such as "
+                                "one encoded for motion/haptics. Sony's at9tool can, but was not found among "
+                                "Wwise's plug-ins or on the PATH; pass its path with --at9tool.")
+        path, codec, bit_rate = at9
+        return decode_with_at9tool(found, path, source, scratch), codec, bit_rate, "at9tool"
 
 
 def wem_is_ambisonic(path: str) -> bool:
@@ -1542,6 +1650,9 @@ def parse_args() -> argparse.Namespace:
                         help="ask Wwise to convert the Sound when its converted file does not exist yet")
     parser.add_argument("--vgmstream", metavar="PATH",
                         help="vgmstream-cli to decode with; by default the one beside this script, else the one on the PATH")
+    parser.add_argument("--at9tool", metavar="PATH",
+                        help="Sony's at9tool, which decodes the ATRAC9 that vgmstream cannot (that encoded for "
+                             "motion/haptics); by default the one among Wwise's plug-ins, else the one on the PATH")
     parser.add_argument("--waapi-url", metavar="URL",
                         help="address of the Wwise Authoring API, if not the default ws://127.0.0.1:8080/waapi")
     parser.add_argument("--per-channel", action="store_true",
@@ -1685,8 +1796,8 @@ def analyse_sound(args: argparse.Namespace, target: Optional[str], title: str, f
     with tempfile.TemporaryDirectory(prefix=f"{TOOL_NAME}_") as scratch:
         codec, bit_rate, decoded, decoder = "", "", item.converted, ""
         if Path(item.converted).suffix.lower() != ".wav":
-            decoded, codec, bit_rate = decode_with_vgmstream(find_vgmstream(args.vgmstream), item.converted, scratch)
-            decoder = "vgmstream"
+            decoded, codec, bit_rate, decoder = decode(item.converted, scratch, args.vgmstream, args.at9tool,
+                                                       item.wwise_bin)
         original, converted = read_wav(item.original), read_wav(decoded)
 
     files: Rows = [("Original", file_details(item.original, original, "", "")),

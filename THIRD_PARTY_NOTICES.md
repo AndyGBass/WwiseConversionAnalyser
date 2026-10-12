@@ -38,6 +38,14 @@ themselves state them.
 These files are passed on exactly as vgmstream distributes them. If you need a build without a particular
 library, or the source for one, get it from vgmstream or from the library's own project.
 
+## Used from your Wwise installation
+
+### at9tool
+
+Not in this download. To decode ATRAC9 that was encoded for motion/haptics, which vgmstream does not read,
+WwiseConversionAnalyser runs the `at9tool.exe` that a Wwise installation with a PlayStation platform already
+has in its `plugins` folder. It is Sony Interactive Entertainment's software and is used under their terms.
+
 ## Installed separately
 
 These are not in this download. `pip` installs them from the Python Package Index.
