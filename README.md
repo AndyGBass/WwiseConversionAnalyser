@@ -40,7 +40,7 @@ Windows only.
    <your Wwise project>\Add-ons\Commands\WwiseConversionAnalyser
    ```
 
-   The folder must have exactly that name. A ZIP from GitHub unpacks as `WwiseConversionAnalyser-main`: rename it.
+   The folder must have exactly that name. A ZIP from GitHub unpacks with an ending, such as `WwiseConversionAnalyser-1.0.0` or `WwiseConversionAnalyser-main`: rename it.
 
 3. In Wwise, open **Project > User Preferences** and tick **Enable Wwise Authoring API**.
 

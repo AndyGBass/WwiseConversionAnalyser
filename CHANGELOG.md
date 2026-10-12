@@ -4,7 +4,7 @@ All notable changes to WwiseConversionAnalyser are recorded here. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version numbers follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - 2026-10-11
+## [1.0.0] - 2026-10-12
 
 First release.
 
