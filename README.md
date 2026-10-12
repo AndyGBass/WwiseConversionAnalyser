@@ -9,10 +9,13 @@ It only reads from Wwise. Nothing in the project is changed.
 Full Report
 ![A WwiseConversionAnalyser report](docs/images/report.png)
 
-Example of the difference between Vorbis on Windows vs ADPCM on PS5. The converison is what matters, not the platform specifically.
+Example of the difference between Vorbis on Windows vs ADPCM on PS5. The conversion is what matters, not the platform specifically.
 ![A WwiseConversionAnalyser report](docs/images/spectogramplatformdifference.png)
+
 Windows loses everything above roughly 17 kHz (the light blue strip), which is Vorbis’s own cutoff at this quality.
-PS5 keeps the full range and is slightly louder than the original above about 10 kHz (the red band at the top) but to ADPCM behaviour.
+
+PS5 keeps the full range and is slightly louder than the original above about 10 kHz (the red band at the top) due to ADPCM behaviour.
+
 Both Conversions have louder and quieter patches throughout between the two different conversions.
 
 
