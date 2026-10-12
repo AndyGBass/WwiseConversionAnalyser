@@ -18,6 +18,11 @@ PS5 keeps the full range and is slightly louder than the original above about 10
 
 Both Conversions have louder and quieter patches throughout between the two different conversions.
 
+Vorbis Q4 vs Vorbis Q6
+![A WwiseConversionAnalyser report](docs/images/spectogramvorbisdifference.png)
+
+Quality 4 removes everything above roughly 17 kHz for the whole sound. Quality 6 keeps the full range at first and only decreases at about 20 kHz from around 0.8 seconds on.
+
 
 ## Install
 
